@@ -1,0 +1,24 @@
+{
+  "collections": {
+    "bell": {
+      "documents": {
+        "state": {
+          "fields": {
+            "activeAlarm": { "type": "boolean" },
+            "rungAt": { "type": "number" },
+            "recentRings": { "type": "array", "items": { "type": "number" } }
+          }
+        }
+      }
+    },
+    "presence": {
+      "documents": {
+        "{deviceId}": {
+          "fields": {
+            "lastSeen": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

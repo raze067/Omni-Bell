@@ -1,0 +1,6 @@
+{
+  "name": "Omni",
+  "description": "A real-time bell application that notifies all connected devices on the network using WebSockets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
