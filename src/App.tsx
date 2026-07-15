@@ -52,6 +52,7 @@ export default function App() {
   const [recentRings, setRecentRings] = useState<number[]>([]);
   const [now, setNow] = useState(Date.now());
   const [audioReady, setAudioReady] = useState(false);
+  const [serverSkew, setServerSkew] = useState(0);
   
   const [currentDeviceName, setCurrentDeviceName] = useState(defaultDeviceName);
   const [isEditingName, setIsEditingName] = useState(false);
@@ -59,12 +60,20 @@ export default function App() {
   
   const audioCtxRef = useRef<AudioContext | null>(null);
   const alarmIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const localRingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastProcessedRingIdRef = useRef<string>('');
+  const serverSkewRef = useRef<number>(0);
+  const writeStartTimeRef = useRef<number>(0);
 
   const stopAlarmLocally = () => {
     setRinging(false);
     if (alarmIntervalRef.current) {
       clearInterval(alarmIntervalRef.current);
       alarmIntervalRef.current = null;
+    }
+    if (localRingTimeoutRef.current) {
+      clearTimeout(localRingTimeoutRef.current);
+      localRingTimeoutRef.current = null;
     }
   };
 
@@ -120,7 +129,6 @@ export default function App() {
   };
 
   const triggerAlarmLoopLocally = () => {
-    if (ringing) return; // already ringing
     setRinging(true);
     playBellSound();
     
@@ -128,6 +136,11 @@ export default function App() {
     alarmIntervalRef.current = setInterval(() => {
       playBellSound();
     }, 2000);
+
+    if (localRingTimeoutRef.current) clearTimeout(localRingTimeoutRef.current);
+    localRingTimeoutRef.current = setTimeout(() => {
+      stopAlarmLocally();
+    }, 15000); // Ring for max 15 seconds locally
   };
 
   useEffect(() => {
@@ -137,17 +150,34 @@ export default function App() {
     const unsubscribeBell = onSnapshot(bellDocRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
-        const lastRingAt = data.lastRingAt || 0;
+        const status = data.status || 'silenced';
+        const ringId = data.ringId || '';
         const caller = data.triggeredBy || '';
         
         setCallerName(caller);
         
-        // If the ring was within the last 15 seconds, we consider it active
-        const isCurrentlyRinging = (Date.now() - lastRingAt) < 15000;
-        
-        if (isCurrentlyRinging) {
-          triggerAlarmLoopLocally();
-        } else {
+        if (status === 'ringing') {
+          const isNewRing = ringId !== lastProcessedRingIdRef.current;
+          if (isNewRing) {
+            let shouldRing = true;
+            if (!lastProcessedRingIdRef.current) {
+              const lastRingAt = data.lastRingAt || 0;
+              const estimatedServerNow = Date.now() + serverSkewRef.current;
+              // If the ring is older than 15 seconds, don't ring upon page load
+              if (estimatedServerNow - lastRingAt > 15000) {
+                shouldRing = false;
+              }
+            }
+            
+            lastProcessedRingIdRef.current = ringId;
+            if (shouldRing) {
+              triggerAlarmLoopLocally();
+            } else {
+              stopAlarmLocally();
+            }
+          }
+        } else if (status === 'silenced') {
+          lastProcessedRingIdRef.current = ringId;
           stopAlarmLocally();
         }
 
@@ -156,12 +186,19 @@ export default function App() {
           setRecentRings(sorted);
         }
       }
+    }, (error) => {
+      console.error('Firestore Bell state stream error:', error);
     });
 
     const presenceDocRef = doc(db, 'presence', deviceId);
     const updatePresence = async () => {
       try {
-        await setDoc(presenceDocRef, { lastSeen: Date.now(), name: currentDeviceName }, { merge: true });
+        writeStartTimeRef.current = Date.now();
+        await setDoc(presenceDocRef, { 
+          lastSeenLocal: Date.now(),
+          lastSeenServer: serverTimestamp(),
+          name: currentDeviceName 
+        }, { merge: true });
       } catch (err) {
         console.error('Error updating presence:', err);
       }
@@ -174,17 +211,40 @@ export default function App() {
       const docs: ActiveDevice[] = [];
       snapshot.forEach((doc) => {
         const data = doc.data();
-        if (data.lastSeen) {
-          docs.push({ id: doc.id, name: data.name || 'Unnamed Device', lastSeen: data.lastSeen });
+        if (data.lastSeenServer) {
+          let serverTimeMs = Date.now();
+          if (typeof data.lastSeenServer.toDate === 'function') {
+            serverTimeMs = data.lastSeenServer.toDate().getTime();
+          } else if (data.lastSeenServer.seconds) {
+            serverTimeMs = data.lastSeenServer.seconds * 1000;
+          }
+
+          docs.push({ 
+            id: doc.id, 
+            name: data.name || 'Unnamed Device', 
+            lastSeen: serverTimeMs 
+          });
+
+          if (doc.id === deviceId && data.lastSeenLocal) {
+            const localTimeMs = data.lastSeenLocal;
+            const rtt = Date.now() - writeStartTimeRef.current;
+            const estimatedServerTimeAtReceipt = serverTimeMs + (rtt / 2);
+            const computedSkew = estimatedServerTimeAtReceipt - Date.now();
+            
+            setServerSkew(computedSkew);
+            serverSkewRef.current = computedSkew;
+          }
         }
       });
       setPresenceDocs(docs);
+    }, (error) => {
+      console.error('Firestore Presence stream error:', error);
     });
 
     const timeInterval = setInterval(() => setNow(Date.now()), 1000);
 
     const handleUnload = () => {
-      setDoc(presenceDocRef, { lastSeen: 0 }, { merge: true });
+      setDoc(presenceDocRef, { lastSeenServer: null }, { merge: true });
     };
     window.addEventListener('beforeunload', handleUnload);
 
@@ -206,17 +266,11 @@ export default function App() {
 
   // Derive active devices locally so it updates immediately when time passes
   useEffect(() => {
-    const list = presenceDocs.filter(d => (now - d.lastSeen) < 25000);
+    const estimatedServerNow = now + serverSkew;
+    const list = presenceDocs.filter(d => (estimatedServerNow - d.lastSeen) < 25000);
     setActiveDevices(list);
     setOnlineCount(Math.max(1, list.length));
-    
-    // Auto-stop alarm if time passed 15s since lastRingAt
-    // (Handled partially by the snapshot, but if snapshot doesn't fire, this acts as a fallback)
-    if (ringing) {
-      // We don't have lastRingAt directly here, but we can just use a local timeout if needed.
-      // But actually, onSnapshot handles the data, so it's fine.
-    }
-  }, [presenceDocs, now, ringing]);
+  }, [presenceDocs, now, serverSkew]);
 
   useEffect(() => {
     if (!joined) return;
@@ -249,22 +303,23 @@ export default function App() {
     
     if (ringing) {
       try {
-        // Silence the alarm by setting lastRingAt far into the past
-        await setDoc(bellDocRef, { lastRingAt: 0 }, { merge: true });
+        await setDoc(bellDocRef, { status: 'silenced' }, { merge: true });
         stopAlarmLocally();
       } catch (err) {
         console.error('Error stopping alarm:', err);
       }
     } else {
       try {
-        const ringTime = Date.now();
+        const estimatedRingTime = Date.now() + serverSkewRef.current;
+        const newRingId = 'ring_' + estimatedRingTime + '_' + Math.random().toString(36).substring(2, 9);
         await setDoc(bellDocRef, {
-          lastRingAt: ringTime,
+          ringId: newRingId,
+          status: 'ringing',
+          lastRingAt: estimatedRingTime,
           triggeredBy: currentDeviceName,
-          recentRings: arrayUnion(ringTime)
+          recentRings: arrayUnion(estimatedRingTime)
         }, { merge: true });
         
-        // Optimistically start ringing locally
         triggerAlarmLoopLocally();
       } catch (err) {
         console.error('Error ringing bell:', err);
@@ -282,7 +337,12 @@ export default function App() {
     if (joined) {
       const presenceDocRef = doc(db, 'presence', deviceId);
       try {
-        await setDoc(presenceDocRef, { lastSeen: Date.now(), name: trimmed }, { merge: true });
+        writeStartTimeRef.current = Date.now();
+        await setDoc(presenceDocRef, { 
+          lastSeenLocal: Date.now(),
+          lastSeenServer: serverTimestamp(),
+          name: trimmed 
+        }, { merge: true });
       } catch (err) {
         console.error('Error syncing name on Firebase:', err);
       }
