@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="omniGradMask" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E86732" />
+      <stop offset="100%" stop-color="#D4541F" />
+    </linearGradient>
+    <filter id="shadowMask" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.18" />
+    </filter>
+  </defs>
+  <!-- Full-bleed background for maskable adaptive cropping -->
+  <rect width="512" height="512" fill="url(#omniGradMask)" />
+  
+  <!-- Chime Bell Icon in strictly padded Safe Zone (60% to 80% inner circle) -->
+  <g transform="translate(156, 145) scale(0.82)" filter="url(#shadowMask)">
+    <!-- Bell Crown Loop -->
+    <path d="M120 18 C108 18 98 28 98 40 L142 40 C142 28 132 18 120 18 Z" fill="#FFFFFF" opacity="0.9" />
+    <!-- Bell Body -->
+    <path d="M120 40 C65 40 45 92 45 155 C45 198 32 215 15 228 C8 234 12 246 22 246 L218 246 C228 246 232 234 225 228 C208 215 195 198 195 155 C195 92 175 40 120 40 Z" fill="#FFFFFF" />
+    <!-- Clapper -->
+    <circle cx="120" cy="268" r="24" fill="#FFFFFF" opacity="0.95" />
+    <!-- Sound Waves -->
+    <path d="M22 100 C8 120 8 160 22 180" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.6" />
+    <path d="M218 100 C232 120 232 160 218 180" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.6" />
+  </g>
+</svg>
