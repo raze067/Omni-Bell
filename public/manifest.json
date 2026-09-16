@@ -1,0 +1,21 @@
+{
+  "name": "Omni Chime",
+  "short_name": "Omni",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#FAF9F7",
+  "theme_color": "#E05D25",
+  "description": "Spatial chime network.",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon.ico",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

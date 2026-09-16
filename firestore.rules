@@ -7,5 +7,15 @@ service cloud.firestore {
     match /presence/{document} {
       allow read, write: if true;
     }
+    match /rooms/{roomId} {
+      allow read, write: if true;
+      match /bell/{document} {
+        allow read, write: if true;
+      }
+      match /presence/{document} {
+        allow read, write: if true;
+      }
+    }
   }
 }
+

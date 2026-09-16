@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Bell, Users, History, BellOff, Edit2, Check, X, Sparkles, Volume2 } from 'lucide-react';
+import { Bell, Users, History, BellOff, Edit2, Check, X, Sparkles, Volume2, LogOut, ArrowRight, Plus } from 'lucide-react';
 import { db } from './firebase';
-import { doc, setDoc, updateDoc, onSnapshot, collection, arrayUnion, serverTimestamp } from 'firebase/firestore';
+import { doc, setDoc, onSnapshot, collection, arrayUnion, serverTimestamp, writeBatch } from 'firebase/firestore';
 
 interface ActiveDevice {
   id: string;
@@ -20,8 +20,8 @@ const deviceId = (() => {
 
 const defaultDeviceName = (() => {
   let name = localStorage.getItem('bell_device_name');
-  if (!name) {
-    name = 'Device ' + Math.floor(1 + Math.random() * 9);
+  if (!name || name.match(/^Device \d$/)) {
+    name = 'Device ' + Math.floor(1000 + Math.random() * 9000);
     localStorage.setItem('bell_device_name', name);
   }
   return name;
@@ -29,23 +29,31 @@ const defaultDeviceName = (() => {
 
 function formatRelativeTime(date: number, now: number) {
   const diffInSeconds = Math.floor((now - date) / 1000);
-  
   if (diffInSeconds < 10) return 'just now';
   if (diffInSeconds < 60) return `${diffInSeconds}s ago`;
-  
   const diffInMinutes = Math.floor(diffInSeconds / 60);
   if (diffInMinutes < 60) return diffInMinutes === 1 ? '1m ago' : `${diffInMinutes}m ago`;
-  
   const diffInHours = Math.floor(diffInMinutes / 60);
   if (diffInHours < 24) return diffInHours === 1 ? '1h ago' : `${diffInHours}h ago`;
-  
   return 'a while ago';
 }
 
 export default function App() {
+  const [roomId, setRoomId] = useState<string>(() => {
+    const hash = window.location.hash.replace('#', '');
+    if (hash) return hash;
+    return localStorage.getItem('bell_room_id') || '';
+  });
+  const [joinRoomInput, setJoinRoomInput] = useState(roomId);
   const [joined, setJoined] = useState(() => localStorage.getItem('bell_joined') === 'true');
+  
+  const [roomName, setRoomName] = useState(roomId);
+  const [isEditingRoomName, setIsEditingRoomName] = useState(false);
+  const [tempRoomName, setTempRoomName] = useState('');
+
   const [ringing, setRinging] = useState(false);
   const [callerName, setCallerName] = useState('');
+  const [callerId, setCallerId] = useState('');
   const [onlineCount, setOnlineCount] = useState(1);
   const [presenceDocs, setPresenceDocs] = useState<ActiveDevice[]>([]);
   const [activeDevices, setActiveDevices] = useState<ActiveDevice[]>([]);
@@ -53,6 +61,9 @@ export default function App() {
   const [now, setNow] = useState(Date.now());
   const [audioReady, setAudioReady] = useState(false);
   const [serverSkew, setServerSkew] = useState(0);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    'Notification' in window && Notification.permission === 'granted'
+  );
   
   const [currentDeviceName, setCurrentDeviceName] = useState(defaultDeviceName);
   const [isEditingName, setIsEditingName] = useState(false);
@@ -144,17 +155,30 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!joined) return;
+    if (!joined || !roomId) return;
 
-    const bellDocRef = doc(db, 'bell', 'state');
+    // Listen to Room Metadata
+    const roomDocRef = doc(db, 'rooms', roomId);
+    const unsubscribeRoom = onSnapshot(roomDocRef, (docSnap) => {
+      if (docSnap.exists() && docSnap.data().name) {
+        setRoomName(docSnap.data().name);
+      } else {
+        setRoomName(roomId);
+      }
+    });
+
+    // Use Room-specific paths
+    const bellDocRef = doc(db, 'rooms', roomId, 'bell', 'state');
     const unsubscribeBell = onSnapshot(bellDocRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
         const status = data.status || 'silenced';
         const ringId = data.ringId || '';
         const caller = data.triggeredBy || '';
+        const callerDeviceId = data.triggeredById || '';
         
         setCallerName(caller);
+        setCallerId(callerDeviceId);
         
         if (status === 'ringing') {
           const isNewRing = ringId !== lastProcessedRingIdRef.current;
@@ -172,6 +196,17 @@ export default function App() {
             lastProcessedRingIdRef.current = ringId;
             if (shouldRing) {
               triggerAlarmLoopLocally();
+              
+              // Trigger local notification if in background
+              if (document.hidden || document.visibilityState !== 'visible') {
+                if ('Notification' in window && Notification.permission === 'granted') {
+                  const notif = new Notification("Omni Chime", {
+                    body: `${caller || 'Someone'} is ringing the chime in room ${roomId}!`,
+                    icon: '/favicon.ico'
+                  });
+                  // Optionally play sound if allowed, but browsers restrict this if in background
+                }
+              }
             } else {
               stopAlarmLocally();
             }
@@ -190,7 +225,7 @@ export default function App() {
       console.error('Firestore Bell state stream error:', error);
     });
 
-    const presenceDocRef = doc(db, 'presence', deviceId);
+    const presenceDocRef = doc(db, 'rooms', roomId, 'presence', deviceId);
     const updatePresence = async () => {
       try {
         writeStartTimeRef.current = Date.now();
@@ -207,7 +242,7 @@ export default function App() {
     updatePresence();
     const presenceInterval = setInterval(updatePresence, 10000);
 
-    const unsubscribePresence = onSnapshot(collection(db, 'presence'), (snapshot) => {
+    const unsubscribePresence = onSnapshot(collection(db, 'rooms', roomId, 'presence'), (snapshot) => {
       const docs: ActiveDevice[] = [];
       snapshot.forEach((doc) => {
         const data = doc.data();
@@ -254,9 +289,11 @@ export default function App() {
       clearInterval(presenceInterval);
       clearInterval(timeInterval);
       window.removeEventListener('beforeunload', handleUnload);
+      handleUnload(); // Call it explicitly on cleanup
       stopAlarmLocally();
+      unsubscribeRoom();
     };
-  }, [joined, currentDeviceName]);
+  }, [joined, roomId, currentDeviceName]);
 
   useEffect(() => {
     if (ringing && audioReady) {
@@ -290,8 +327,25 @@ export default function App() {
     };
   }, [joined]);
 
-  const handleJoin = () => {
+  const requestNotificationPermission = async () => {
+    if ('Notification' in window) {
+      const permission = await Notification.requestPermission();
+      setNotificationsEnabled(permission === 'granted');
+    }
+  };
+
+  const handleJoinOrCreateRoom = (e: React.FormEvent) => {
+    e.preventDefault();
     ensureAudioContext();
+    requestNotificationPermission(); // Ask for notifications when joining
+    let finalRoomId = joinRoomInput.trim().toUpperCase();
+    if (!finalRoomId) {
+      // Create a random room if empty
+      finalRoomId = Math.random().toString(36).substring(2, 6).toUpperCase();
+    }
+    setRoomId(finalRoomId);
+    window.location.hash = finalRoomId;
+    localStorage.setItem('bell_room_id', finalRoomId);
     localStorage.setItem('bell_joined', 'true');
     setJoined(true);
   };
@@ -299,7 +353,7 @@ export default function App() {
   const handleRing = async () => {
     ensureAudioContext();
 
-    const bellDocRef = doc(db, 'bell', 'state');
+    const bellDocRef = doc(db, 'rooms', roomId, 'bell', 'state');
     
     if (ringing) {
       try {
@@ -317,6 +371,7 @@ export default function App() {
           status: 'ringing',
           lastRingAt: estimatedRingTime,
           triggeredBy: currentDeviceName,
+          triggeredById: deviceId,
           recentRings: arrayUnion(estimatedRingTime)
         }, { merge: true });
         
@@ -334,8 +389,8 @@ export default function App() {
     setCurrentDeviceName(trimmed);
     setIsEditingName(false);
     
-    if (joined) {
-      const presenceDocRef = doc(db, 'presence', deviceId);
+    if (joined && roomId) {
+      const presenceDocRef = doc(db, 'rooms', roomId, 'presence', deviceId);
       try {
         writeStartTimeRef.current = Date.now();
         await setDoc(presenceDocRef, { 
@@ -354,28 +409,89 @@ export default function App() {
     setIsEditingName(true);
   };
 
-  if (!joined) {
+  const leaveRoom = () => {
+    // Clear presence
+    if (joined && roomId) {
+      const presenceDocRef = doc(db, 'rooms', roomId, 'presence', deviceId);
+      setDoc(presenceDocRef, { lastSeenServer: null }, { merge: true });
+    }
+    setJoined(false);
+    setRoomId('');
+    setJoinRoomInput('');
+    window.location.hash = '';
+    localStorage.removeItem('bell_joined');
+    localStorage.removeItem('bell_room_id');
+    stopAlarmLocally();
+  };
+
+  const saveRoomName = async (newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) {
+      setIsEditingRoomName(false);
+      return;
+    }
+    setIsEditingRoomName(false);
+    
+    if (joined && roomId) {
+      try {
+        await setDoc(doc(db, 'rooms', roomId), { name: trimmed }, { merge: true });
+      } catch (err) {
+        console.error('Error saving room name:', err);
+      }
+    }
+  };
+
+  if (!joined || !roomId) {
     return (
       <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center justify-center p-6 text-[#1C1917] font-sans">
-        <div className="max-w-sm w-full bg-white rounded-3xl p-10 shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-[#F5F3F0] flex flex-col items-center text-center">
-          <div className="w-20 h-20 bg-[#E05D25]/10 rounded-full flex items-center justify-center mb-8 text-[#E05D25]">
+        <div className="max-w-sm w-full bg-white rounded-[32px] p-10 shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-[#F5F3F0] flex flex-col items-center text-center relative overflow-hidden">
+          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-[#E05D25] to-[#FCA5A5]" />
+          <div className="w-20 h-20 bg-[#E05D25]/10 rounded-full flex items-center justify-center mb-6 text-[#E05D25]">
             <Bell className="w-10 h-10" strokeWidth={1.5} />
           </div>
-          <h1 className="text-4xl font-display font-bold tracking-tight mb-3">Omni</h1>
-          <p className="text-[#78716C] mb-10 text-sm leading-relaxed">
-            Connect to the spatial chime network to send and receive real-time bell notifications.
+          <h1 className="text-4xl font-display font-bold tracking-tight mb-2">Omni</h1>
+          <p className="text-[#78716C] mb-8 text-sm leading-relaxed">
+            Connect to the spatial chime network. Host or join a room.
           </p>
-          <button 
-            onClick={handleJoin}
-            className="w-full py-4 bg-[#E05D25] hover:bg-[#D4541F] active:scale-95 text-white rounded-2xl font-semibold transition-all flex items-center justify-center gap-2 shadow-[0_10px_20px_-10px_rgba(224,93,37,0.4)] outline-none"
-          >
-            <Sparkles className="w-5 h-5 text-orange-200" />
-            Enable Sound & Join
-          </button>
+          
+          <form onSubmit={handleJoinOrCreateRoom} className="w-full flex flex-col gap-4">
+            <div className="relative">
+              <input 
+                type="text"
+                value={joinRoomInput}
+                onChange={(e) => setJoinRoomInput(e.target.value.toUpperCase())}
+                placeholder="Enter Room Code (e.g. XY3V)"
+                className="w-full px-5 py-4 bg-[#FAF9F7] border border-[#E5E5E5] rounded-2xl text-base font-semibold text-center outline-none focus:border-[#E05D25] focus:ring-2 focus:ring-[#E05D25]/20 transition-all uppercase placeholder:normal-case placeholder:font-medium placeholder:text-[#A8A29E]"
+              />
+            </div>
+            
+            <button 
+              type="submit"
+              className="w-full py-4 bg-[#E05D25] hover:bg-[#D4541F] active:scale-95 text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-2 shadow-[0_10px_20px_-10px_rgba(224,93,37,0.4)] outline-none"
+            >
+              {joinRoomInput ? (
+                <>
+                  <ArrowRight className="w-5 h-5" />
+                  Join Room
+                </>
+              ) : (
+                <>
+                  <Plus className="w-5 h-5" />
+                  Create New Room
+                </>
+              )}
+            </button>
+          </form>
+          
+          <p className="mt-8 text-[11px] font-medium text-[#A8A29E] uppercase tracking-wider">
+            Audio & Notifications requested upon join
+          </p>
         </div>
       </div>
     );
   }
+
+  const isSender = callerId === deviceId;
 
   return (
     <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center pt-20 pb-16 px-6 text-[#1C1917] font-sans">
@@ -399,17 +515,28 @@ export default function App() {
             <Bell className="w-24 h-24 text-white relative z-10 animate-bounce" strokeWidth={1.5} />
           </div>
           <div className="text-center px-6 max-w-sm mb-12">
-            <h2 className="text-3xl font-display font-bold tracking-tight mb-2">
-              {callerName ? callerName : 'Someone'} is calling
-            </h2>
-            <p className="text-white/80 text-sm font-medium">Sound is ringing across the network.</p>
+            {isSender ? (
+              <>
+                <h2 className="text-3xl font-display font-bold tracking-tight mb-2">
+                  Calling Everyone...
+                </h2>
+                <p className="text-white/80 text-sm font-medium">They are hearing the chime.</p>
+              </>
+            ) : (
+              <>
+                <h2 className="text-3xl font-display font-bold tracking-tight mb-2">
+                  {callerName ? callerName : 'Someone'} is calling
+                </h2>
+                <p className="text-white/80 text-sm font-medium">Sound is ringing on your device.</p>
+              </>
+            )}
           </div>
           <button
             onClick={handleRing}
             className="flex items-center gap-3 bg-white text-[#E05D25] px-10 py-4 rounded-full font-bold text-base hover:bg-orange-50 active:scale-95 transition-all shadow-xl"
           >
             <BellOff className="w-5 h-5" />
-            Silence Chime
+            {isSender ? 'Stop Calling' : 'Silence Chime'}
           </button>
         </div>
       )}
@@ -417,13 +544,54 @@ export default function App() {
       <div className="flex flex-col items-center relative z-10 w-full max-w-sm">
         
         {/* Header */}
-        <div className="mb-14 text-center">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-white border border-[#F5F3F0] rounded-full text-[10px] font-bold text-[#A8A29E] tracking-widest uppercase mb-6 shadow-sm">
-            <span className="w-1.5 h-1.5 bg-[#10B981] rounded-full animate-pulse" />
-            Portal Active
+        <div className="mb-12 w-full flex flex-col items-center">
+          <div className="w-full flex items-center justify-between mb-8">
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-white border border-[#F5F3F0] rounded-full text-[10px] font-bold text-[#A8A29E] tracking-widest uppercase shadow-sm">
+              <span className="w-1.5 h-1.5 bg-[#10B981] rounded-full animate-pulse" />
+              Room ID: {roomId}
+            </div>
+            
+            <button 
+              onClick={leaveRoom}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-[#FAF9F7] active:bg-[#F5F3F0] border border-[#F5F3F0] rounded-full text-[10px] font-bold text-[#E05D25] tracking-widest uppercase shadow-sm transition-colors"
+            >
+              <LogOut className="w-3 h-3" />
+              Leave
+            </button>
           </div>
-          <h1 className="text-5xl font-display font-bold tracking-tighter mb-3">Omni</h1>
-          <p className="text-[#78716C] text-sm font-medium">
+          
+          <h1 className="text-xl font-bold tracking-widest text-[#E05D25] uppercase mb-4 opacity-80">Omni</h1>
+          
+          {isEditingRoomName ? (
+            <form 
+              onSubmit={(e) => { e.preventDefault(); saveRoomName(tempRoomName); }}
+              className="flex items-center justify-center gap-2 w-full max-w-xs px-4"
+            >
+              <input
+                type="text"
+                value={tempRoomName}
+                onChange={(e) => setTempRoomName(e.target.value)}
+                className="w-full px-2 py-2 text-3xl sm:text-4xl font-display font-bold text-center border-b-2 border-[#E05D25] bg-transparent outline-none"
+                autoFocus
+                onBlur={() => saveRoomName(tempRoomName)}
+                maxLength={24}
+              />
+            </form>
+          ) : (
+            <div 
+              className="group flex items-center justify-center gap-2 cursor-pointer relative w-full"
+              onClick={() => { setTempRoomName(roomName); setIsEditingRoomName(true); }}
+            >
+              <h2 className="text-4xl sm:text-5xl font-display font-bold tracking-tighter text-center w-full truncate px-8">
+                {roomName}
+              </h2>
+              <button className="absolute right-0 p-2 text-gray-300 group-hover:text-[#E05D25] transition-colors rounded-full sm:-right-8">
+                <Edit2 className="w-4 h-4 sm:w-5 sm:h-5" />
+              </button>
+            </div>
+          )}
+          
+          <p className="text-[#78716C] text-sm font-medium text-center mt-4">
             {ringing ? 'Broadcasting chime...' : 'Tap the bell to call everyone.'}
           </p>
         </div>
