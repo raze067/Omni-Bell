@@ -2,6 +2,13 @@ import { SoundTone } from '../types';
 
 let audioCtx: AudioContext | null = null;
 let masterGainNode: GainNode | null = null;
+let keepAliveActive = false;
+let keepAliveInterval: any = null;
+
+export function isAudioUnlocked(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem('omni_audio_unlocked') === 'true';
+}
 
 export function getAudioContext(): AudioContext | null {
   if (typeof window === 'undefined') return null;
@@ -38,6 +45,10 @@ export function getMasterVolume(): number {
   return 0.8;
 }
 
+/**
+ * Ensures AudioContext is active and running.
+ * If suspended, immediately attempts to resume it.
+ */
 export async function ensureAudioRunning(): Promise<boolean> {
   const ctx = getAudioContext();
   if (!ctx) return false;
@@ -48,13 +59,73 @@ export async function ensureAudioRunning(): Promise<boolean> {
       console.warn('AudioContext resume error:', e);
     }
   }
-  return ctx.state === 'running';
+
+  if (ctx.state === 'running') {
+    localStorage.setItem('omni_audio_unlocked', 'true');
+    initAlwaysOnKeepAlive();
+    return true;
+  }
+  return false;
 }
 
-export function playTone(tone: SoundTone = 'classic') {
-  const ctx = getAudioContext();
-  if (!ctx || ctx.state !== 'running' || !masterGainNode) return;
+/**
+ * Initializes listeners and silent micro-loop to prevent mobile browsers
+ * from auto-suspending the audio pipeline when idling or backgrounded.
+ */
+export function initAlwaysOnKeepAlive() {
+  if (typeof window === 'undefined' || keepAliveActive) return;
+  keepAliveActive = true;
 
+  // Set Media Session metadata to inform mobile OS of active audio player
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Omni Chime Active',
+        artist: 'Omni Service Bell',
+        album: 'Chime System',
+        artwork: [
+          { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' }
+        ]
+      });
+    } catch (e) {}
+  }
+
+  const autoWake = async () => {
+    const ctx = getAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch (e) {}
+    }
+  };
+
+  // Aggressive auto-wake across browser lifecycle events
+  window.addEventListener('visibilitychange', autoWake);
+  window.addEventListener('focus', autoWake);
+  window.addEventListener('pageshow', autoWake);
+  window.addEventListener('touchstart', autoWake, { passive: true });
+  window.addEventListener('pointerdown', autoWake, { passive: true });
+  window.addEventListener('click', autoWake, { passive: true });
+
+  // Play an inaudible 1-sample buffer every 25 seconds to keep the hardware audio session alive
+  if (!keepAliveInterval) {
+    keepAliveInterval = setInterval(() => {
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === 'running' && masterGainNode) {
+        try {
+          const silentBuffer = ctx.createBuffer(1, 1, 22050);
+          const source = ctx.createBufferSource();
+          source.buffer = silentBuffer;
+          source.connect(ctx.destination);
+          source.start(0);
+        } catch (e) {}
+      }
+    }, 25000);
+  }
+}
+
+function renderTone(ctx: AudioContext, gainNode: GainNode, tone: SoundTone) {
   const t = ctx.currentTime;
 
   switch (tone) {
@@ -78,7 +149,7 @@ export function playTone(tone: SoundTone = 'classic') {
         gain.gain.exponentialRampToValueAtTime(0.0001, t + p.decay);
 
         osc.connect(gain);
-        gain.connect(masterGainNode!);
+        gain.connect(gainNode);
         osc.start(t);
         osc.stop(t + p.decay + 0.1);
       });
@@ -98,7 +169,7 @@ export function playTone(tone: SoundTone = 'classic') {
         gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
 
         osc.connect(gain);
-        gain.connect(masterGainNode!);
+        gain.connect(gainNode);
         osc.start(startTime);
         osc.stop(startTime + duration + 0.1);
       };
@@ -123,7 +194,7 @@ export function playTone(tone: SoundTone = 'classic') {
         gain.gain.exponentialRampToValueAtTime(0.001, startTime + 0.6);
 
         osc.connect(gain);
-        gain.connect(masterGainNode!);
+        gain.connect(gainNode);
         osc.start(startTime);
         osc.stop(startTime + 0.7);
       });
@@ -144,7 +215,7 @@ export function playTone(tone: SoundTone = 'classic') {
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
 
       osc.connect(gain);
-      gain.connect(masterGainNode!);
+      gain.connect(gainNode);
       osc.start(t);
       osc.stop(t + 0.9);
       break;
@@ -162,7 +233,7 @@ export function playTone(tone: SoundTone = 'classic') {
         gain.gain.linearRampToValueAtTime(0.25, startTime + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
         osc.connect(gain);
-        gain.connect(masterGainNode!);
+        gain.connect(gainNode);
         osc.start(startTime);
         osc.stop(startTime + duration + 0.1);
       };
@@ -175,3 +246,28 @@ export function playTone(tone: SoundTone = 'classic') {
     }
   }
 }
+
+/**
+ * Plays the requested chime tone.
+ * If AudioContext was suspended by mobile OS, automatically wakes it and sounds the chime.
+ */
+export async function playTone(tone: SoundTone = 'classic') {
+  const ctx = getAudioContext();
+  if (!ctx || !masterGainNode) return;
+
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch (e) {
+      console.warn('Could not auto-resume audio context in playTone:', e);
+    }
+  }
+
+  if (ctx.state === 'running') {
+    renderTone(ctx, masterGainNode, tone);
+  }
+}
+
+export const unlockPersistentAudio = ensureAudioRunning;
+export const isAudioAuthorized = isAudioUnlocked;
+

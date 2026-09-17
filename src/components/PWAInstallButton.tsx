@@ -63,10 +63,11 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ variant = 'p
       {variant === 'icon' && (
         <button
           onClick={handleClick}
-          className="p-2 bg-white hover:bg-orange-50 active:scale-95 border border-[#F5F3F0] rounded-full text-[#E05D25] shadow-sm transition-colors cursor-pointer"
+          className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center bg-white hover:bg-orange-50 active:scale-95 border border-[#F0EEEB] rounded-full text-[#E05D25] shadow-2xs transition-colors cursor-pointer touch-manipulation"
           title="Install Omni App"
+          aria-label="Install Omni App"
         >
-          <Download className="w-3.5 h-3.5" />
+          <Download className="w-4 h-4" />
         </button>
       )}
 

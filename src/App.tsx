@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { 
   Bell, 
   Users, 
@@ -21,13 +21,14 @@ import {
 import { db } from './firebase';
 import { doc, setDoc, onSnapshot, collection, arrayUnion, serverTimestamp } from 'firebase/firestore';
 import { ActiveDevice, SoundTone, CallPresetTag, Acknowledgment, BellState } from './types';
-import { playTone, ensureAudioRunning } from './utils/audio';
+import { playTone, ensureAudioRunning, unlockPersistentAudio, isAudioAuthorized } from './utils/audio';
 import { ShareModal } from './components/ShareModal';
 import { SettingsModal } from './components/SettingsModal';
 import { CallOverlay } from './components/CallOverlay';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { PWAInstallModal } from './components/PWAInstallModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { StartupAnimation } from './components/StartupAnimation';
 
 const deviceId = (() => {
   let id = localStorage.getItem('bell_device_id');
@@ -97,8 +98,20 @@ export default function App() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showInstallModal, setShowInstallModal] = useState(false);
 
+  // Cool startup animation on initial open
+  const [showStartup, setShowStartup] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return !sessionStorage.getItem('omni_startup_shown');
+  });
+
+  const handleStartupComplete = useCallback(() => {
+    try {
+      sessionStorage.setItem('omni_startup_shown', 'true');
+    } catch (e) {}
+    setShowStartup(false);
+  }, []);
+
   const [presenceDocs, setPresenceDocs] = useState<ActiveDevice[]>([]);
-  const [activeDevices, setActiveDevices] = useState<ActiveDevice[]>([]);
   const [recentRings, setRecentRings] = useState<number[]>([]);
   const [now, setNow] = useState(Date.now());
   const [audioReady, setAudioReady] = useState(false);
@@ -106,6 +119,16 @@ export default function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(
     'Notification' in window && Notification.permission === 'granted'
   );
+
+  // Performance-optimized memoized device lists (zero redundant re-renders)
+  const activeDevices = useMemo(() => {
+    const estimatedServerNow = now + serverSkew;
+    return presenceDocs.filter(d => (estimatedServerNow - d.lastSeen) < 25000);
+  }, [presenceDocs, now, serverSkew]);
+
+  const otherDevices = useMemo(() => {
+    return activeDevices.filter(d => d.id !== deviceId);
+  }, [activeDevices]);
 
   // Wake Lock state
   const [wakeLockActive, setWakeLockActive] = useState(false);
@@ -357,7 +380,7 @@ export default function App() {
       console.error('Firestore Presence stream error:', error);
     });
 
-    const timeInterval = setInterval(() => setNow(Date.now()), 1000);
+    const timeInterval = setInterval(() => setNow(Date.now()), 5000);
 
     const handleUnload = () => {
       setDoc(presenceDocRef, { lastSeenServer: null }, { merge: true });
@@ -376,25 +399,23 @@ export default function App() {
     };
   }, [joined, roomId, currentDeviceName]);
 
-  // Derive active devices locally
-  useEffect(() => {
-    const estimatedServerNow = now + serverSkew;
-    const list = presenceDocs.filter(d => (estimatedServerNow - d.lastSeen) < 25000);
-    setActiveDevices(list);
-  }, [presenceDocs, now, serverSkew]);
-
-  // Unlock audio context on initial interaction
+  // Persistent Always-On Audio initialization
   useEffect(() => {
     if (!joined) return;
 
-    ensureAudioRunning().then(ready => setAudioReady(ready));
+    // If audio was previously authorized, eagerly unlock and prime it
+    if (isAudioAuthorized()) {
+      unlockPersistentAudio().then(ready => setAudioReady(ready));
+    } else {
+      ensureAudioRunning().then(ready => setAudioReady(ready));
+    }
 
     const handleInteraction = () => {
-      ensureAudioRunning().then(ready => setAudioReady(ready));
+      unlockPersistentAudio().then(ready => setAudioReady(ready));
     };
 
-    window.addEventListener('click', handleInteraction);
-    window.addEventListener('touchstart', handleInteraction);
+    window.addEventListener('click', handleInteraction, { passive: true });
+    window.addEventListener('touchstart', handleInteraction, { passive: true });
 
     return () => {
       window.removeEventListener('click', handleInteraction);
@@ -411,7 +432,7 @@ export default function App() {
 
   const handleJoinOrCreateRoom = (e: React.FormEvent) => {
     e.preventDefault();
-    ensureAudioRunning().then(ready => setAudioReady(ready));
+    unlockPersistentAudio().then(ready => setAudioReady(ready));
     requestNotificationPermission();
     let finalRoomId = joinRoomInput.trim().toUpperCase();
     if (!finalRoomId) {
@@ -424,8 +445,19 @@ export default function App() {
     setJoined(true);
   };
 
+  const joinRoomById = (id: string) => {
+    unlockPersistentAudio().then(ready => setAudioReady(ready));
+    requestNotificationPermission();
+    const finalRoomId = id.trim().toUpperCase();
+    setRoomId(finalRoomId);
+    window.location.hash = finalRoomId;
+    localStorage.setItem('bell_room_id', finalRoomId);
+    localStorage.setItem('bell_joined', 'true');
+    setJoined(true);
+  };
+
   const handleRing = async () => {
-    ensureAudioRunning().then(ready => setAudioReady(ready));
+    unlockPersistentAudio().then(ready => setAudioReady(ready));
     if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
       try { navigator.vibrate(35); } catch (e) {}
     }
@@ -550,52 +582,98 @@ export default function App() {
 
   if (!joined || !roomId) {
     return (
-      <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center justify-center p-6 text-[#1C1917] font-sans">
-        <div className="max-w-sm w-full bg-white rounded-[32px] p-8 sm:p-10 shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-[#F5F3F0] flex flex-col items-center text-center relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-[#E05D25] to-[#FCA5A5]" />
-          <div className="w-20 h-20 bg-[#E05D25]/10 rounded-full flex items-center justify-center mb-6 text-[#E05D25]">
-            <Bell className="w-10 h-10" strokeWidth={1.5} />
+      <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center justify-center p-4 sm:p-6 text-[#1C1917] font-sans relative selection:bg-[#E05D25]/20">
+        {/* Startup Animation on Cold Boot */}
+        {showStartup && (
+          <StartupAnimation 
+            onComplete={handleStartupComplete} 
+            appName="Omni" 
+          />
+        )}
+
+        <div className="max-w-md w-full bg-white rounded-[32px] p-7 sm:p-9 shadow-[0_12px_40px_rgb(0,0,0,0.04)] border border-[#F0EEEB] flex flex-col items-center text-center relative overflow-hidden">
+          {/* Subtle top accent bar */}
+          <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-[#E05D25] via-[#F97316] to-[#FCA5A5]" />
+          
+          {/* Acoustic Chime Emblem */}
+          <div className="relative flex items-center justify-center w-20 h-20 mb-5">
+            <div className="absolute inset-0 rounded-full bg-[#E05D25]/10 animate-ping opacity-60" style={{ animationDuration: '3s' }} />
+            <div className="absolute inset-2 rounded-full border border-[#E05D25]/20" />
+            <div className="relative z-10 w-16 h-16 bg-gradient-to-tr from-[#E05D25] to-[#F97316] rounded-full flex items-center justify-center text-white shadow-[0_8px_20px_-4px_rgba(224,93,37,0.4)]">
+              <Bell className="w-8 h-8 text-white" strokeWidth={1.75} />
+            </div>
           </div>
-          <h1 className="text-4xl font-display font-bold tracking-tight mb-2">Omni</h1>
-          <p className="text-[#78716C] mb-8 text-sm leading-relaxed">
-            Connect to the spatial chime network. Host or join a room.
+
+          <h1 className="text-3xl sm:text-4xl font-display font-black tracking-tight text-[#1C1917] mb-1">
+            Omni
+          </h1>
+          <p className="text-[#78716C] mb-7 text-xs sm:text-sm font-medium leading-relaxed max-w-xs">
+            Spatial chime and presence network for all your connected devices.
           </p>
           
-          <form onSubmit={handleJoinOrCreateRoom} className="w-full flex flex-col gap-3.5">
-            <div className="relative">
+          <form onSubmit={handleJoinOrCreateRoom} className="w-full flex flex-col gap-3">
+            <div className="relative w-full">
               <input 
                 type="text"
                 value={joinRoomInput}
                 onChange={(e) => setJoinRoomInput(e.target.value.toUpperCase())}
                 placeholder="Enter Room Code (e.g. XY3V)"
-                className="w-full px-5 py-4 bg-[#FAF9F7] border border-[#E5E5E5] rounded-2xl text-base font-semibold text-center outline-none focus:border-[#E05D25] focus:ring-2 focus:ring-[#E05D25]/20 transition-all uppercase placeholder:normal-case placeholder:font-medium placeholder:text-[#A8A29E]"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck="false"
+                maxLength={12}
+                className="w-full px-5 py-4 bg-[#FAF9F7] border border-[#E5E5E5] rounded-2xl text-base font-bold text-center outline-none focus:border-[#E05D25] focus:ring-2 focus:ring-[#E05D25]/20 transition-all uppercase placeholder:normal-case placeholder:font-medium placeholder:text-[#A8A29E]"
               />
+              {joinRoomInput && (
+                <button
+                  type="button"
+                  onClick={() => setJoinRoomInput('')}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 p-1.5 text-[#A8A29E] hover:text-[#1C1917] bg-white rounded-full border border-[#E5E5E5] transition-colors"
+                  aria-label="Clear code"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
             
             <button 
               type="submit"
-              className="w-full py-4 bg-[#E05D25] hover:bg-[#D4541F] active:scale-95 text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-2 shadow-[0_10px_20px_-10px_rgba(224,93,37,0.4)] outline-none cursor-pointer"
+              className="w-full py-4 min-h-[52px] bg-[#E05D25] hover:bg-[#D4541F] active:scale-98 text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-2 shadow-[0_12px_24px_-8px_rgba(224,93,37,0.45)] outline-none cursor-pointer touch-manipulation"
             >
-              {joinRoomInput ? (
+              {joinRoomInput.trim() ? (
                 <>
                   <ArrowRight className="w-5 h-5" />
-                  Join Room
+                  <span>Join Room {joinRoomInput.trim()}</span>
                 </>
               ) : (
                 <>
                   <Plus className="w-5 h-5" />
-                  Create New Room
+                  <span>Create New Room</span>
                 </>
               )}
             </button>
           </form>
 
-          <div className="w-full mt-5">
+          {/* Quick Alternative Action */}
+          <div className="mt-3">
+            <button
+              type="button"
+              onClick={() => {
+                const randomId = Math.random().toString(36).substring(2, 6).toUpperCase();
+                joinRoomById(randomId);
+              }}
+              className="text-xs font-semibold text-[#78716C] hover:text-[#E05D25] transition-colors py-1 px-2"
+            >
+              or generate random private room
+            </button>
+          </div>
+
+          <div className="w-full mt-4">
             <PWAInstallButton variant="banner" />
           </div>
           
-          <p className="mt-6 text-[11px] font-medium text-[#A8A29E] uppercase tracking-wider">
-            Audio & Network chime requested upon join
+          <p className="mt-5 text-[10px] font-semibold text-[#A8A29E] uppercase tracking-wider">
+            Persistent audio chime unlocked upon room join
           </p>
         </div>
         <OfflineIndicator />
@@ -607,13 +685,21 @@ export default function App() {
   const recentAckActive = lastAck && (now - lastAck.timestamp < 35000);
 
   return (
-    <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center pt-8 sm:pt-12 pb-16 px-4 sm:px-6 text-[#1C1917] font-sans overflow-x-hidden">
+    <div className="min-h-screen bg-[#FAF9F7] flex flex-col items-center pt-6 sm:pt-10 pb-16 px-4 sm:px-6 text-[#1C1917] font-sans overflow-x-hidden selection:bg-[#E05D25]/20">
       
+      {/* Startup Animation on Cold Boot */}
+      {showStartup && (
+        <StartupAnimation 
+          onComplete={handleStartupComplete} 
+          appName="Omni" 
+        />
+      )}
+
       {/* Audio Suspended Standby Banner */}
       {!audioReady && (
         <div 
           onClick={() => ensureAudioRunning().then(r => setAudioReady(r))}
-          className="fixed top-4 left-4 right-4 z-40 max-w-sm mx-auto bg-white border border-[#E05D25]/30 text-[#E05D25] px-4 py-3 rounded-2xl text-xs sm:text-sm font-semibold flex items-center justify-between shadow-lg cursor-pointer transition-transform hover:scale-[1.01] active:scale-95 animate-pulse"
+          className="fixed top-4 left-4 right-4 z-40 max-w-md mx-auto bg-white border border-[#E05D25]/30 text-[#E05D25] px-4 py-3 rounded-2xl text-xs sm:text-sm font-semibold flex items-center justify-between shadow-lg cursor-pointer transition-transform hover:scale-[1.01] active:scale-95 animate-pulse"
         >
           <div className="flex items-center gap-2.5">
             <Volume2 className="w-4 h-4 shrink-0" />
@@ -638,52 +724,60 @@ export default function App() {
         />
       )}
 
-      <div className="flex flex-col items-center relative z-10 w-full max-w-sm">
+      <div className="flex flex-col items-center relative z-10 w-full max-w-md mx-auto">
         
-        {/* Top Control Bar */}
-        <div className="w-full flex items-center justify-between mb-8">
+        {/* Top Control Bar: Optimized for all screens */}
+        <div className="w-full flex items-center justify-between gap-2 mb-6 sm:mb-8">
           {/* Room ID Badge & Share Trigger */}
-          <button 
-            onClick={() => setShowShareModal(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-orange-50 border border-[#F5F3F0] rounded-full text-[11px] font-bold text-[#1C1917] tracking-wider uppercase shadow-sm transition-all active:scale-95"
-            title="Invite & Share Room"
-          >
-            <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-            <span>{roomId}</span>
-            <QrCode className="w-3.5 h-3.5 text-[#E05D25]" />
-          </button>
+          <div className="flex items-center gap-2 min-w-0">
+            <button 
+              onClick={() => setShowShareModal(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-2 bg-white hover:bg-orange-50 border border-[#F0EEEB] rounded-full text-[11px] font-bold text-[#1C1917] tracking-wider uppercase shadow-2xs transition-all active:scale-95 cursor-pointer touch-manipulation"
+              title="Invite & Share Room Code"
+              aria-label={`Room code ${roomId}, tap to share`}
+            >
+              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse shrink-0" />
+              <span className="truncate max-w-[80px] sm:max-w-none">{roomId}</span>
+              <QrCode className="w-3.5 h-3.5 text-[#E05D25] shrink-0" />
+            </button>
 
-          {/* Network Latency Indicator */}
-          <div className="inline-flex items-center gap-1.5 text-[10px] font-mono font-semibold text-[#A8A29E] bg-white px-2.5 py-1 rounded-full border border-[#F5F3F0] shadow-2xs">
-            <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" />
-            <span>{Math.abs(Math.round(serverSkew))}ms</span>
+            {/* Network Latency Indicator */}
+            <div className="hidden xs:inline-flex items-center gap-1.5 text-[10px] font-mono font-semibold text-[#78716C] bg-white px-2.5 py-1.5 rounded-full border border-[#F0EEEB] shadow-2xs shrink-0">
+              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" />
+              <span>{Math.abs(Math.round(serverSkew))}ms</span>
+            </div>
           </div>
 
-          {/* Preferences, Install & Leave Controls */}
-          <div className="flex items-center gap-1.5">
+          {/* Action Buttons Group (Comfortable touch targets >= 40px) */}
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <PWAInstallButton variant="icon" />
+            
             <button 
               onClick={() => setShowSettingsModal(true)}
-              className="p-2 bg-white hover:bg-[#FAF9F7] active:scale-95 border border-[#F5F3F0] rounded-full text-[#78716C] hover:text-[#E05D25] shadow-sm transition-colors cursor-pointer"
+              className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center bg-white hover:bg-[#FAF9F7] active:scale-95 border border-[#F0EEEB] rounded-full text-[#78716C] hover:text-[#E05D25] shadow-2xs transition-all cursor-pointer touch-manipulation"
               title="Preferences, Tones & Volume"
+              aria-label="Settings and Preferences"
             >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <SlidersHorizontal className="w-4 h-4" />
             </button>
+            
             <button 
               onClick={leaveRoom}
-              className="inline-flex items-center gap-1 px-3 py-1.5 bg-white hover:bg-rose-50 active:scale-95 border border-[#F5F3F0] rounded-full text-[10px] font-bold text-rose-600 tracking-wider uppercase shadow-sm transition-colors cursor-pointer"
+              className="h-9 sm:h-10 px-3 bg-white hover:bg-rose-50 active:scale-95 border border-[#F0EEEB] hover:border-rose-200 rounded-full text-[11px] font-bold text-rose-600 tracking-wider uppercase shadow-2xs transition-all flex items-center gap-1.5 cursor-pointer touch-manipulation"
+              title="Leave Room"
+              aria-label="Leave Room"
             >
-              <LogOut className="w-3 h-3" />
-              Leave
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Leave</span>
             </button>
           </div>
         </div>
 
         {/* Brand & Room Name Header */}
-        <div className="mb-8 w-full flex flex-col items-center">
-          <h1 className="text-xs font-bold tracking-widest text-[#E05D25] uppercase mb-2">
+        <div className="mb-6 sm:mb-8 w-full flex flex-col items-center">
+          <span className="text-[11px] font-black tracking-[0.25em] text-[#E05D25] uppercase mb-1.5 pl-0.5">
             Omni
-          </h1>
+          </span>
           
           {isEditingRoomName ? (
             <form 
@@ -694,7 +788,7 @@ export default function App() {
                 type="text"
                 value={tempRoomName}
                 onChange={(e) => setTempRoomName(e.target.value)}
-                className="w-full px-2 py-1.5 text-3xl font-display font-bold text-center border-b-2 border-[#E05D25] bg-transparent outline-none"
+                className="w-full px-2 py-1.5 text-2xl sm:text-3xl font-display font-bold text-center border-b-2 border-[#E05D25] bg-transparent outline-none"
                 autoFocus
                 onBlur={() => saveRoomName(tempRoomName)}
                 maxLength={24}
@@ -702,72 +796,73 @@ export default function App() {
             </form>
           ) : (
             <div 
-              className="group flex items-center justify-center gap-1.5 cursor-pointer relative w-full"
+              className="group flex items-center justify-center gap-2 cursor-pointer relative w-full"
               onClick={() => { setTempRoomName(roomName); setIsEditingRoomName(true); }}
+              title="Tap to rename room"
             >
-              <h2 className="text-3xl sm:text-4xl font-display font-bold tracking-tight text-center truncate px-6">
+              <h2 className="text-2xl sm:text-3xl font-display font-bold tracking-tight text-center truncate px-2">
                 {roomName}
               </h2>
-              <button 
-                className="text-gray-300 group-hover:text-[#E05D25] transition-colors p-1 rounded-full"
+              <span 
+                className="text-[#A8A29E] group-hover:text-[#E05D25] transition-colors p-1 rounded-full"
                 aria-label="Rename room"
               >
-                <Edit2 className="w-4 h-4" />
-              </button>
+                <Edit2 className="w-3.5 h-3.5" />
+              </span>
             </div>
           )}
           
-          <p className="text-[#78716C] text-xs font-medium text-center mt-2">
-            Tap the bell to alert connected devices.
+          <p className="text-[#78716C] text-xs font-medium text-center mt-1.5">
+            Ready • Tap the bell to alert devices
           </p>
         </div>
 
         {/* Live Acknowledgment Toast Banner */}
         {recentAckActive && (
-          <div className="w-full mb-6 p-3 bg-white border border-emerald-200 rounded-2xl flex items-center justify-between shadow-sm animate-in fade-in duration-300">
-            <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
-                <MessageSquare className="w-3.5 h-3.5" />
+          <div className="w-full mb-5 p-3.5 bg-white border border-emerald-200 rounded-2xl flex items-center justify-between shadow-xs animate-in fade-in duration-300">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+                <MessageSquare className="w-4 h-4" />
               </div>
-              <div className="text-left">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 block">
+              <div className="text-left truncate">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 block truncate">
                   {lastAck.by} responded:
                 </span>
-                <span className="text-xs font-semibold text-[#1C1917]">
+                <span className="text-xs font-semibold text-[#1C1917] block truncate">
                   "{lastAck.text}"
                 </span>
               </div>
             </div>
-            <span className="text-[10px] text-[#A8A29E] font-medium shrink-0">
+            <span className="text-[10px] text-[#A8A29E] font-medium shrink-0 ml-2">
               {formatRelativeTime(lastAck.timestamp, now)}
             </span>
           </div>
         )}
 
-        {/* Call Context Preset Tags */}
+        {/* Call Context Preset Tags: Smooth Touch Snapping */}
         <div className="w-full mb-6">
           <div className="flex items-center justify-between mb-2 px-1">
             <span className="text-[10px] font-bold text-[#A8A29E] tracking-widest uppercase">
               Call Reason
             </span>
-            <span className="text-[10px] font-medium text-[#78716C]">
+            <span className="text-[11px] font-semibold text-[#78716C]">
               {selectedTag.label}
             </span>
           </div>
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1.5 scrollbar-none -mx-1 px-1">
+          <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none snap-x -mx-2 px-2">
             {PRESET_TAGS.map(tag => {
               const isSelected = selectedTag.id === tag.id;
               return (
                 <button
                   key={tag.id}
                   onClick={() => setSelectedTag(tag)}
-                  className={`px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all active:scale-95 cursor-pointer border ${
+                  className={`snap-start px-3.5 py-2 min-h-[38px] rounded-full text-xs font-semibold whitespace-nowrap transition-all active:scale-95 cursor-pointer border touch-manipulation ${
                     isSelected
                       ? 'bg-[#E05D25] text-white border-[#E05D25] shadow-xs'
                       : 'bg-white text-[#78716C] hover:text-[#1C1917] border-[#F0EEEB]'
                   }`}
                 >
-                  <span className="mr-1">{tag.emoji}</span>
+                  <span className="mr-1.5">{tag.emoji}</span>
                   <span>{tag.label}</span>
                 </button>
               );
@@ -777,14 +872,14 @@ export default function App() {
 
         {/* Targeted Device Indicator (if device paging is active) */}
         {targetDevice && (
-          <div className="w-full mb-4 px-3.5 py-2 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs">
+          <div className="w-full mb-4 px-3.5 py-2.5 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs animate-in fade-in">
             <div className="flex items-center gap-2 text-amber-900 font-semibold truncate">
-              <Radio className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <Radio className="w-4 h-4 text-amber-600 shrink-0" />
               <span className="truncate">Direct paging to: {targetDevice.name}</span>
             </div>
             <button
               onClick={() => setTargetDevice(null)}
-              className="text-amber-700 hover:text-amber-900 font-bold text-[11px] uppercase tracking-wider flex items-center gap-1 ml-2 shrink-0 cursor-pointer"
+              className="text-amber-700 hover:text-amber-900 font-bold text-[11px] uppercase tracking-wider flex items-center gap-1 ml-2 shrink-0 cursor-pointer p-1"
             >
               <XCircle className="w-3.5 h-3.5" />
               <span>Broadcast</span>
@@ -792,32 +887,38 @@ export default function App() {
           </div>
         )}
 
-        {/* Tactile Bell Button */}
-        <div className="relative mb-14 flex justify-center w-full">
+        {/* Tactile Bell Button with Concentric Acoustic Rings */}
+        <div className="relative my-6 sm:my-8 flex justify-center w-full">
+          {/* Ambient Acoustic Aura Rings */}
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className={`w-72 h-72 sm:w-80 sm:h-80 rounded-full border border-[#E05D25]/15 ${ringing ? 'animate-ping' : ''}`} />
+            <div className="absolute w-64 h-64 sm:w-72 sm:h-72 rounded-full border border-[#E05D25]/20" />
+          </div>
+
           <button
             onClick={handleRing}
             aria-label="Ring the chime"
             className={`
-              flex flex-col items-center justify-center w-60 h-60 sm:w-64 sm:h-64 rounded-full cursor-pointer
-              transition-all duration-300 outline-none select-none active:scale-95
+              relative z-10 flex flex-col items-center justify-center w-56 h-56 sm:w-64 sm:h-64 rounded-full cursor-pointer
+              transition-all duration-300 outline-none select-none active:scale-95 touch-manipulation
               ${ringing 
-                ? 'bg-[#CC511E] text-white shadow-inner scale-95 ring-8 ring-[#E05D25]/20' 
-                : 'bg-[#E05D25] text-white hover:bg-[#E86732] hover:scale-[1.02] shadow-[0_24px_48px_-12px_rgba(224,93,37,0.35)]'
+                ? 'bg-[#CC511E] text-white shadow-inner scale-95 ring-8 ring-[#E05D25]/25' 
+                : 'bg-gradient-to-br from-[#E05D25] via-[#E86732] to-[#D4541F] text-white hover:scale-[1.02] shadow-[0_24px_48px_-12px_rgba(224,93,37,0.4)]'
               }
             `}
           >
             <Bell className={`w-20 h-20 sm:w-24 sm:h-24 ${ringing ? 'animate-bounce' : ''}`} strokeWidth={1.5} />
-            <span className="mt-2 text-xs font-bold uppercase tracking-widest opacity-80">
-              {ringing ? 'Silence' : (targetDevice ? 'Page Device' : 'Ring Everyone')}
+            <span className="mt-2.5 text-xs font-bold uppercase tracking-widest text-white/90">
+              {ringing ? 'Silence' : (targetDevice ? `Page ${targetDevice.name}` : 'Ring Everyone')}
             </span>
           </button>
         </div>
 
-        {/* Info Cards */}
-        <div className="w-full space-y-4">
+        {/* Info Cards Container */}
+        <div className="w-full space-y-4 mt-4">
           
           {/* Presence Card */}
-          <div className="bg-white border border-[#F5F3F0] rounded-[24px] p-5 sm:p-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
+          <div className="bg-white border border-[#F0EEEB] rounded-[24px] p-5 sm:p-6 shadow-[0_8px_24px_rgb(0,0,0,0.02)]">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <Users className="w-4 h-4 text-[#A8A29E]" />
@@ -827,7 +928,7 @@ export default function App() {
               </div>
               <button 
                 onClick={openRenameModal}
-                className="text-xs font-bold text-[#E05D25] hover:text-[#CC511E] transition-colors flex items-center gap-1.5 px-3 py-1 bg-[#E05D25]/10 rounded-full cursor-pointer"
+                className="text-xs font-bold text-[#E05D25] hover:text-[#CC511E] transition-colors flex items-center gap-1.5 px-3 py-1.5 bg-[#E05D25]/10 rounded-full cursor-pointer active:scale-95"
               >
                 <Edit2 className="w-3 h-3" />
                 Rename You
@@ -836,41 +937,50 @@ export default function App() {
             
             <div className="flex flex-col gap-2.5">
               {/* Current Device ("You") */}
-              <div className="flex items-center justify-between p-2.5 rounded-xl bg-[#FAF9F7] border border-[#F0EEEB]">
-                <div className="flex items-center gap-2 truncate">
-                  <span className="w-2 h-2 bg-[#E05D25] rounded-full shrink-0" />
-                  <span className="text-sm font-semibold text-[#1C1917] truncate">{currentDeviceName}</span>
+              <div className="flex items-center justify-between p-3 rounded-2xl bg-[#FAF9F7] border border-[#F0EEEB]">
+                <div className="flex items-center gap-2.5 truncate">
+                  <span className="w-2.5 h-2.5 bg-[#E05D25] rounded-full shrink-0 shadow-xs" />
+                  <span className="text-sm font-bold text-[#1C1917] truncate">{currentDeviceName}</span>
                 </div>
-                <span className="text-[10px] font-bold text-[#A8A29E] uppercase tracking-wider bg-white px-2 py-0.5 rounded-md border border-[#E5E5E5] shrink-0">
-                  This Device
-                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-[10px] font-bold text-[#A8A29E] uppercase tracking-wider bg-white px-2 py-0.5 rounded-md border border-[#E5E5E5]">
+                    This Device
+                  </span>
+                  <button
+                    onClick={openRenameModal}
+                    className="p-1 text-[#A8A29E] hover:text-[#E05D25] transition-colors"
+                    title="Rename this device"
+                  >
+                    <Edit2 className="w-3 h-3" />
+                  </button>
+                </div>
               </div>
               
-              {/* Other Devices with 1-Tap Paging */}
-              {activeDevices.filter(d => d.id !== deviceId).length === 0 ? (
-                <div className="py-2 text-center text-xs text-[#A8A29E]">
+              {/* Other Devices with 1-Tap Direct Paging */}
+              {otherDevices.length === 0 ? (
+                <div className="py-3 text-center text-xs text-[#A8A29E] font-medium">
                   Waiting for other devices to join room {roomId}...
                 </div>
               ) : (
-                activeDevices.filter(d => d.id !== deviceId).map((device) => {
+                otherDevices.map((device) => {
                   const isTargeted = targetDevice?.id === device.id;
                   return (
                     <div 
                       key={device.id} 
-                      className={`flex items-center justify-between p-2.5 rounded-xl border transition-colors ${
+                      className={`flex items-center justify-between p-3 rounded-2xl border transition-colors ${
                         isTargeted ? 'bg-amber-50/70 border-amber-200' : 'bg-white border-[#F0EEEB]'
                       }`}
                     >
-                      <div className="flex items-center gap-2 truncate">
+                      <div className="flex items-center gap-2.5 truncate">
                         <span className="w-2 h-2 bg-emerald-500 rounded-full shrink-0" />
-                        <span className="text-sm font-medium text-[#1C1917] truncate">{device.name}</span>
+                        <span className="text-sm font-semibold text-[#1C1917] truncate">{device.name}</span>
                       </div>
 
                       <button
                         onClick={() => setTargetDevice(isTargeted ? null : device)}
-                        className={`text-xs font-bold px-2.5 py-1 rounded-lg transition-all active:scale-95 cursor-pointer ${
+                        className={`text-xs font-bold px-3 py-1.5 min-h-[34px] rounded-xl transition-all active:scale-95 cursor-pointer touch-manipulation ${
                           isTargeted
-                            ? 'bg-amber-500 text-white'
+                            ? 'bg-amber-500 text-white shadow-xs'
                             : 'bg-[#FAF9F7] hover:bg-orange-50 text-[#78716C] hover:text-[#E05D25] border border-[#E5E5E5]'
                         }`}
                         title={isTargeted ? 'Reset to call everyone' : `Page only ${device.name}`}
@@ -885,7 +995,7 @@ export default function App() {
           </div>
 
           {/* History Card */}
-          <div className="bg-white border border-[#F5F3F0] rounded-[24px] p-5 sm:p-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
+          <div className="bg-white border border-[#F0EEEB] rounded-[24px] p-5 sm:p-6 shadow-[0_8px_24px_rgb(0,0,0,0.02)]">
             <div className="flex items-center gap-2 mb-4">
               <History className="w-4 h-4 text-[#A8A29E]" />
               <h3 className="text-xs font-bold text-[#A8A29E] tracking-widest uppercase">Activity Log</h3>
@@ -894,9 +1004,9 @@ export default function App() {
             {recentRings.length === 0 ? (
               <p className="text-xs text-[#78716C] font-medium text-center py-3">No chimes yet in this room.</p>
             ) : (
-              <div className="space-y-3">
+              <div className="space-y-2.5">
                 {recentRings.map((timestamp, index) => (
-                  <div key={index} className="flex items-center justify-between text-xs">
+                  <div key={index} className="flex items-center justify-between text-xs py-1">
                     <span className={`font-semibold ${index === 0 ? 'text-[#1C1917]' : 'text-[#78716C]'}`}>
                       {index === 0 ? 'Latest Chime' : 'Previous Chime'}
                     </span>

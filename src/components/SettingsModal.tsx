@@ -136,6 +136,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Hardware & Mobile Settings */}
         <div className="space-y-2 pt-2 border-t border-[#F0EEEB]">
+          {/* Always-On Audio Status */}
+          <div className="flex items-center justify-between p-3 bg-[#FAF9F7] rounded-2xl border border-[#F0EEEB]">
+            <div className="flex items-center gap-2.5">
+              <Volume2 className="w-4 h-4 text-emerald-600" />
+              <div>
+                <span className="text-xs font-bold text-[#1C1917] block">Always-On Audio</span>
+                <span className="text-[10px] text-[#78716C] block">Persistent media pipeline & auto-resume</span>
+              </div>
+            </div>
+            <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-2 py-1 rounded-lg">
+              Always Active
+            </span>
+          </div>
+
           {/* Wake Lock */}
           {wakeLockSupported && (
             <div className="flex items-center justify-between p-3 bg-[#FAF9F7] rounded-2xl border border-[#F0EEEB]">
@@ -213,6 +227,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <span>Haptic vibration enabled for mobile chimes</span>
             </div>
           )}
+
+          {/* Background Ringing Guide */}
+          <div className="p-3.5 bg-[#FAF9F7] border border-[#F0EEEB] rounded-2xl text-left space-y-1.5 text-[11px] text-[#78716C]">
+            <div className="font-bold text-[#1C1917] text-xs flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-[#E05D25]" />
+              <span>How Background Chimes Work</span>
+            </div>
+            <p>
+              • <strong className="text-[#1C1917]">Phone locked or minimized:</strong> Audio keep-alive & system notifications deliver alerts and vibration.
+            </p>
+            <p>
+              • <strong className="text-[#1C1917]">Completely closed app:</strong> Mobile OS security limits closed web pages from playing continuous audio, but push alerts wake the device.
+            </p>
+            <p>
+              • <strong className="text-[#1C1917]">Dedicated 24/7 bell:</strong> Keep the PWA open on a stand with <em>Keep Screen Awake</em> enabled.
+            </p>
+          </div>
         </div>
       </div>
     </div>
